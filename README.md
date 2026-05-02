@@ -22,6 +22,10 @@
 - [Les compilateurs modernes](#les-compilateurs-modernes)
 - [JIT, AOT et compilation adaptative](#jit-aot-et-compilation-adaptative)
 - [Étude de cas : C → AST → 3-adresses → assembleur](#étude-de-cas--c--ast--3-adresses--assembleur)
+- [Gestion de la mémoire et runtime](#gestion-de-la-mémoire-et-runtime)
+- [Diagnostics et messages d'erreur](#diagnostics-et-messages-derreur)
+- [Bootstrapping et confiance](#bootstrapping-et-confiance)
+- [WebAssembly et générateurs de code alternatifs](#webassembly-et-générateurs-de-code-alternatifs)
 - [Pour aller plus loin](#pour-aller-plus-loin)
 
 ## Introduction
@@ -50,7 +54,9 @@ Un compilateur manipule un vocabulaire technique dense. Voici les définitions c
 | **Expression régulière (regex)** | Description compacte d'un langage régulier ; sert à spécifier les tokens. |
 | **NFA** | *Nondeterministic Finite Automaton*. Automate fini où, depuis un état, plusieurs transitions peuvent porter le même symbole (ou des transitions vides ε). |
 | **DFA** | *Deterministic Finite Automaton*. Automate fini déterministe : un seul état suivant possible par symbole. Forme exécutable d'un lexer. |
-| **Grammaire hors contexte (CFG)** | *Context-Free Grammar*, ensemble de règles `A → α` qui définit la syntaxe du langage. |
+| **Grammaire hors contexte (CFG)** | *Context-Free Grammar*, ensemble de règles `A → α` qui définit la syntaxe du langage. **Attention : même acronyme que le graphe de flot de contrôle.** Le contexte lève l'ambiguïté : *grammaire CFG* (syntaxe) vs *graphe CFG* (flot). |
+| **PEG** | *Parsing Expression Grammar* : grammaire ordonnée à choix prioritaire, sans ambiguïté par construction. |
+| **Pratt parser** | Parser top-down piloté par des *binding powers* gauche/droite ; gère élégamment les opérateurs préfixes, infixes, postfixes et mixfix. |
 | **LL(1)** | Parser top-down qui lit la source de gauche à droite (*Left-to-right*) et produit une dérivation gauche (*Leftmost*) avec **1** token d'anticipation. |
 | **LR(1)** | Parser bottom-up *Left-to-right* + dérivation droite inverse (*Rightmost in reverse*) avec 1 token d'anticipation. |
 | **LALR(1)** | *Look-Ahead LR(1)*. Variante compacte de LR(1) utilisée par `yacc`/`bison`. |
@@ -58,7 +64,9 @@ Un compilateur manipule un vocabulaire technique dense. Voici les définitions c
 | **IR** | *Intermediate Representation* : forme intermédiaire entre source et code machine. |
 | **SSA** | *Static Single Assignment* : forme d'IR dans laquelle chaque variable est affectée exactement une fois. |
 | **Bloc de base** | Suite maximale d'instructions sans branchement entrant ailleurs qu'au début, ni branchement sortant ailleurs qu'à la fin. |
-| **Graphe de flot de contrôle (CFG)** | *Control-Flow Graph* : graphe orienté dont les sommets sont les blocs de base et les arêtes les transferts de contrôle. |
+| **Graphe de flot de contrôle (CFG)** | *Control-Flow Graph* : graphe orienté dont les sommets sont les blocs de base et les arêtes les transferts de contrôle. **Homonyme acronymique** de la grammaire hors contexte ; dans la suite, on écrira *grammaire CFG* ou *graphe CFG* lorsque le risque de confusion existe. |
+| **MIR / HIR / LIR** | Représentations intermédiaires de niveau respectivement moyen, haut et bas. Pipeline canonique : AST → HIR → MIR → LIR → assembleur. |
+| **Bootstrapping** | Auto-compilation : un compilateur écrit dans son propre langage (le compilateur Rust est écrit en Rust, GCC en C/C++, ocamlopt en OCaml). |
 | **Dominateur** | Dans un CFG, le nœud `D` *domine* `N` si tout chemin du point d'entrée à `N` passe par `D`. |
 | **Allocation de registres** | Affectation des variables vivantes à un nombre fini de registres physiques. |
 | **Peephole optimization** | Optimisation locale sur une fenêtre de quelques instructions consécutives. |
@@ -101,6 +109,8 @@ graph LR
 ## Analyse lexicale
 
 L'analyse lexicale (*lexing* ou *scanning*) découpe le flux de caractères du code source en une suite de **tokens** (lexèmes typés). Chaque token est une paire `(type, valeur)` : `(IDENT, "ma_variable")`, `(NOMBRE, 42)`, `(MOT_CLE, "if")`, `(SYMBOLE, "+")`.
+
+> **Définition opérationnelle.** Le lexer **produit** les tokens, le parser les **consomme**. Cette frontière est un contrat unidirectionnel : le lexer ne sait rien de la grammaire du langage (au-delà du *maximal munch* et de la table des mots-clés), le parser ne sait rien des caractères d'origine (au-delà éventuellement des positions, conservées pour les diagnostics). Confondre les deux niveaux est l'erreur la plus fréquente des cours d'introduction : *analyser la syntaxe* signifie reconnaître la structure d'un programme à partir de tokens, pas à partir de caractères.
 
 ### Vocabulaire
 
@@ -169,6 +179,8 @@ graph LR
 ## Analyse syntaxique
 
 L'analyse syntaxique (*parsing*) consomme le flux de tokens et construit un **arbre syntaxique abstrait** (AST) qui représente la structure du programme selon la grammaire du langage. Si la séquence de tokens ne respecte pas la grammaire, le parser émet une erreur de syntaxe.
+
+> **Note terminologique.** « LL(1) » n'est *pas* « le parser » : c'est une **classe** de parsers, c'est-à-dire un sous-ensemble de grammaires reconnaissables par un certain algorithme. Une même grammaire peut être LL(1), LL(*k*), LALR(1), LR(1), GLR ou PEG selon les outils utilisés. Choisir une famille, c'est arbitrer entre puissance grammaticale, qualité des diagnostics, vitesse de compilation et facilité d'implémentation.
 
 ### Grammaires hors contexte (CFG)
 
@@ -250,10 +262,87 @@ Là où un LL(1) décide *à l'avance* quelle règle appliquer, un LR(*k*) lit l
 
 - **LR(1)** : tables potentiellement énormes (un état par contexte de lookahead).
 - **LALR(1)** : fusionne les états LR(1) qui ne diffèrent que par le lookahead. Tables réduites, légère perte d'expressivité, suffisant pour la quasi-totalité des langages réels. C'est l'algorithme de `yacc`, `bison`, `menhir`.
+- **GLR** (*Generalized LR*) : conserve plusieurs piles d'analyse en parallèle pour explorer les ambiguïtés. Utilisé par Bison `%glr-parser`, Elkhound (le parser C++ de Mozilla en son temps), Tree-sitter (pour les éditeurs).
+
+#### LL vs LR : compromis pratiques
+
+| Critère | LL(1) / récursif descendant | LR(1) | LALR(1) | PEG / Pratt |
+|---------|-----------------------------|-------|---------|-------------|
+| Implémentation à la main | facile | hostile | hostile | facile |
+| Puissance grammaticale | la moins étendue | la plus étendue | proche de LR(1) | différente (ordonnée) |
+| Récursivité gauche | interdite (à factoriser) | gérée nativement | gérée nativement | interdite (à factoriser) |
+| Diagnostics d'erreur | excellents (contrôle total) | moyens (table opaque) | moyens | bons |
+| Vitesse de génération | n/a (codé à la main) | longue | rapide | n/a (mémoïsation packrat) |
+| Exemples industriels | gcc, clang, rustc, Roslyn, V8 | rare en l'état | yacc/bison historique, OCaml/menhir | Python ≥ 3.9, Lua, Pest |
+
+Conclusion pragmatique : **commencez en récursif descendant + Pratt**. Passez à un générateur (menhir, lalrpop) si la grammaire devient ingérable à la main, ou à un GLR si elle est franchement ambiguë.
+
+### Récursif descendant + *precedence climbing* : l'approche industrielle
+
+C'est la voie effectivement empruntée par `gcc`, `clang`, le front-end de Roslyn (C#) et `rustc` (avant `chumsky`). On écrit un parser récursif descendant à la main et on délègue les expressions à un sous-parser à **escalade de précédence** (*precedence climbing*) ou Pratt. Avantages décisifs :
+
+- **diagnostics sur mesure** : à chaque appel récursif, on contrôle exactement le contexte ;
+- **récupération d'erreurs** : on peut écrire `recover_until(SEMICOLON)` et continuer ;
+- **code lisible** : le parser ressemble à la grammaire ;
+- **pas d'outil externe** : pas de génération, pas de débogage à travers une table d'états opaque.
+
+Inconvénient : les langages très ambigus (C++ avec son *most vexing parse*, Fortran sans mots réservés) deviennent inconfortables à parser à la main et peuvent tirer parti d'un GLR.
 
 ### Précédence d'opérateurs et Pratt parsing
 
-Pour les langages à expressions riches (Python, JavaScript, Swift), un **Pratt parser** combine récursif descendant et précédence d'opérateurs : chaque token porte une *binding power* (puissance gauche / droite). L'algorithme est concis, élégant, et naturellement extensible aux opérateurs préfixes, postfixes et mixfix.
+Pour les langages à expressions riches (Python, JavaScript, Swift), un **Pratt parser** (Vaughan Pratt, 1973) combine récursif descendant et précédence d'opérateurs : chaque token porte une *binding power* (puissance gauche / droite). L'algorithme est concis, élégant, et naturellement extensible aux opérateurs préfixes, postfixes et mixfix.
+
+#### Exemple Pratt sur `1 + 2 * 3`
+
+Table de précédence (binding power) :
+
+| Token | LBP (left binding power) |
+|-------|---:|
+| `+` | 10 |
+| `*` | 20 |
+| nombre, fin | 0 |
+
+Pseudo-code minimal :
+
+```text
+fonction expr(rbp = 0):
+    g = nud(consume())                     # null-denotation : feuille
+    tant que lbp(peek()) > rbp:
+        op = consume()
+        g = led(op, g, expr(lbp(op)))      # left-denotation : binaire
+    retourner g
+
+nud(NOMBRE n) -> Num(n)
+led(+ , g, d) -> Plus(g, d)
+led(* , g, d) -> Mul(g, d)
+```
+
+Trace pour `1 + 2 * 3` (rbp initial = 0) :
+
+1. `expr(0)` : `nud(1)` donne `Num(1)`. `peek() = +`, `lbp(+) = 10 > 0` : on entre dans la boucle.
+2. On consomme `+` et appelle `expr(10)` pour le membre droit.
+3. `expr(10)` : `nud(2)` donne `Num(2)`. `peek() = *`, `lbp(*) = 20 > 10` : on entre.
+4. On consomme `*` et appelle `expr(20)`. `nud(3)` donne `Num(3)`. `peek()` = fin, `lbp = 0 ≤ 20` : on sort, retour `Num(3)`.
+5. `led(*, Num(2), Num(3))` = `Mul(Num(2), Num(3))`. `peek()` = fin, on sort, retour `Mul(2,3)`.
+6. `led(+, Num(1), Mul(2,3))` = `Plus(Num(1), Mul(Num(2), Num(3)))`. Fin, retour.
+
+Arbre obtenu, avec `*` lié plus fort que `+` :
+
+```text
+       (+)
+      /   \
+   Num(1) (*)
+          /  \
+       Num(2) Num(3)
+```
+
+L'**associativité** se code par une nuance de 1 sur la précédence droite : un opérateur **droit-associatif** (par exemple `^`) appelle `expr(lbp(op) - 1)` pour autoriser un opérateur de même précédence à se rebrancher à droite ; un opérateur **gauche-associatif** appelle `expr(lbp(op))`.
+
+### PEG et packrat parsing
+
+Une **PEG** (*Parsing Expression Grammar*, Bryan Ford 2004) ressemble à une CFG, mais le choix `|` est **ordonné** : la première alternative qui réussit gagne, sans retour arrière. Conséquence : pas d'ambiguïté grammaticale par construction, mais aussi des langages reconnus parfois contre-intuitifs (`a | ab` ne reconnaît jamais `ab`).
+
+Le **packrat parsing** mémoïse chaque tentative `(règle, position)` : la complexité tombe à *O(n)* au prix d'une consommation mémoire proportionnelle à `|grammaire| × |entrée|`. Lua et CPython depuis la 3.9 utilisent un parser PEG, écrit à la main pour Python (Guido van Rossum, *PEP 617*), généré par `pegen`.
 
 ### Familles d'analyseurs
 
@@ -345,6 +434,31 @@ let succ = fun n -> n + 1  — succ : int → int
 ```
 
 L'inférence HM est **complète et décidable** sans annotations dans le fragment let-polymorphe, ce qui explique son succès. Les extensions (sous-typage, types dépendants, GADT) sortent de HM et imposent souvent des annotations.
+
+### Au-delà de Hindley-Milner
+
+Les langages industriels modernes mêlent plusieurs disciplines de typage.
+
+#### Typage bidirectionnel
+
+Le **typage bidirectionnel** (Pierce & Turner, 2000) sépare deux jugements :
+
+- **synthèse** (*infer*) `Γ ⊢ e ⇒ τ` : l'expression `e` produit un type `τ` calculé ;
+- **vérification** (*check*) `Γ ⊢ e ⇐ τ` : on vérifie que `e` a bien le type `τ` attendu par le contexte.
+
+Cette dualité explique pourquoi un littéral entier peut être un `i32` ou un `i64` selon le contexte qui le reçoit, sans annotation explicite. Rust, Swift, TypeScript et Idris en font un usage intensif. C'est la technique qui permet d'introduire le sous-typage, les *generics* et les *higher-rank types* sans casser la décidabilité.
+
+#### Typage graduel
+
+Le **typage graduel** (Siek & Taha, 2006) introduit un type joker `?` (ou `Dynamic`) compatible avec tout autre type. Le compilateur insère des **casts** dynamiques aux frontières typées / non typées. C'est la stratégie de TypeScript (`any`), Python (annotations PEP 484 + `mypy`), Hack, Dart, Typed Racket et Reticulated Python. Le coût d'exécution des casts a été l'une des raisons de l'abandon du *strict gradual typing* dans plusieurs implémentations au profit d'un typage **optionnel** sans vérification à l'exécution.
+
+#### Vérification de propriétés
+
+Au-delà des types « valeur a la forme attendue », certains compilateurs vérifient des propriétés plus riches :
+
+- *borrow checker* de Rust (alias et durées de vie) ;
+- *effect systems* (Koka, OCaml 5) ;
+- *refinement types* (Liquid Haskell, F\*) où `{ x : int | x > 0 }` est un type valide.
 
 ```mermaid
 graph LR
@@ -472,6 +586,27 @@ L'optimisation transforme l'IR pour réduire le temps d'exécution, l'empreinte 
 | *Peephole optimization* | Réécriture locale sur 2-3 instructions consécutives (ex : `mov eax,0` → `xor eax,eax`). |
 
 Une optimisation est **valide** si elle préserve la sémantique du langage. Les optimisations agressives reposent sur les propriétés du langage source (ex. : pas d'aliasing en Rust, *strict aliasing* en C).
+
+### L'ordre des passes : une question de productivité
+
+Les passes d'optimisation ne sont **pas commutatives**. Une mauvaise ordonnance laisse sur la table une grande partie des gains. Quelques règles éprouvées :
+
+1. **Inlining d'abord, ou très tôt.** L'inlining ouvre les frontières d'appel : tout ce qui en dépend (propagation de constantes inter-procédurale, dévirtualisation, élimination de gardes) ne peut commencer qu'après. LLVM exécute son `InlinerPass` au début du pipeline, puis ré-itère.
+2. **Constant folding avant DCE.** Le repli de constantes (`y = 2 * 3` → `y = 6`) crée souvent du code mort (`if (false) { ... }` après propagation). Lancer DCE *avant* le folding nettoie peu ; le lancer *après* nettoie tout.
+3. **SSA avant les optimisations à base de flot.** GVN, LICM, propagation de copies sont triviales en SSA, pénibles sans. La construction SSA est donc une passe précoce.
+4. **CSE / GVN avant *strength reduction*.** Identifier `a*b` dupliqué est plus facile avant qu'il ne soit transformé en série de décalages et additions.
+5. **Boucles : LICM avant déroulage.** Sortir le code invariant *avant* de dérouler évite de dupliquer le travail invariant.
+6. **Allocation de registres en dernier.** Toute optimisation qui change la durée de vie des variables invalide l'analyse de vivacité et devrait précéder l'allocateur.
+7. **Fixed-point.** LLVM, GCC et HotSpot bouclent leur pipeline d'optimisation : chaque passe peut créer du travail pour les précédentes. La boucle s'arrête quand un point fixe est atteint (pas de modification durant un tour) ou quand un budget est épuisé.
+
+```text
+SSA build → SCCP (sparse conditional const prop) → InstCombine
+   → Inliner → SCCP → DCE → SROA → GVN → LICM → IndVarSimplify
+   → LoopUnroll → SLP/Loop Vectorize → InstCombine → DCE
+   → CodeGenPrepare → ISel → RegAlloc → Scheduling → Emit
+```
+
+Cette structure « petite passe locale × itération » est appelée **pipeline canonique LLVM**.
 
 ### Exemple détaillé : LICM
 
@@ -803,6 +938,142 @@ somme_carres:
 ```
 
 On voit le résultat de plusieurs passes : *constant folding* sur la borne, allocation de registres (`s`→`eax`, `i`→`ecx`), peephole (`mov eax,0` initial est conservé ici car `eax` est ensuite incrémenté ; `xor eax,eax` apparaît dans la branche zéro), choix d'instruction (`imul` plutôt qu'une séquence shift/add), respect de l'ABI (`edi` reçoit le premier argument, `eax` rend la valeur).
+
+[Retour en haut de page](#table-des-matières)
+
+## Gestion de la mémoire et runtime
+
+> **Définition.** Le **modèle mémoire** d'un langage répartit la responsabilité de l'allocation et de la désallocation entre le programmeur, le compilateur et un éventuel *runtime* (gestionnaire d'exécution embarqué dans le binaire). Ce choix conditionne le code émis par le back-end : barrières, *write barriers* GC, blocs `drop` insérés à la sortie de portée, comptage de références implicite.
+
+### Trois grandes familles
+
+| Modèle | Qui libère ? | Surcoût d'exécution | Exemples |
+|--------|--------------|---------------------|----------|
+| **Manuel** | le programmeur (`malloc`/`free`, `new`/`delete`) | nul (mais bugs : *use-after-free*, *double-free*, fuites) | C, C++ historique, Zig |
+| **RAII / *ownership*** | le compilateur, déterministe à la sortie de portée | nul ou quasi | C++ moderne (RAII), Rust (*ownership*+*borrow*) |
+| **ARC** (*Automatic Reference Counting*) | runtime, à la dernière référence | incrémenter/décrémenter à chaque copie ; cycles fuient | Swift, Objective-C ARC, Python (CPython) |
+| **GC tracing** | runtime, périodique | pauses GC, *write barriers*, surcoût mémoire | Java, Go, C#, Haskell, OCaml, JavaScript |
+
+### Algorithmes de garbage collection
+
+Le compilateur d'un langage à GC émet du code coopératif avec le collecteur (carte mémoire, *safepoints*, *write barriers*). Les principales familles d'algorithmes :
+
+- **Mark-and-sweep** : marque tout ce qui est atteignable depuis les racines, puis libère le reste. Simple mais fragmente la mémoire.
+- **Mark-compact** : après marquage, compacte les vivants en bord de tas. Élimine la fragmentation au prix d'une passe supplémentaire.
+- **Copying / semi-spaces** (Cheney) : on partage le tas en deux moitiés, on copie les vivants d'une moitié à l'autre, on échange les rôles. Allocation triviale (bump pointer), mais on n'utilise que la moitié du tas.
+- **Generational** : la plupart des objets meurent jeunes (*hypothèse générationnelle*). On alloue en *young generation*, on copie les survivants en *old generation*. La young est collectée fréquemment et vite.
+- **Concurrent / incremental** : le GC tourne en parallèle du *mutator* (le programme), avec des *write barriers* pour suivre les modifications. Exemples : ZGC (Java), Shenandoah, Go (concurrent mark + sweep), V8 Orinoco.
+- **Region-based** (MLton, Cyclone) : statique, le compilateur prouve qu'une région entière est libérable d'un bloc.
+
+### Compile time vs run time
+
+La frontière intéresse directement le compilateur :
+
+- **Allocation au tas** : généralement runtime (`malloc`, `mmap`, GC bump pointer) ; le compilateur insère l'appel.
+- ***Escape analysis*** : passe d'optimisation qui prouve qu'un objet ne s'échappe pas du cadre courant et peut donc être alloué en pile (HotSpot, Go, GraalVM).
+- ***Stack maps*** : tables émises à la compilation décrivant, à chaque *safepoint*, l'emplacement des pointeurs vivants ; consommées par le GC à l'exécution.
+- ***Drop glue*** : Rust émet à la compilation le code qui appellera les destructeurs à la sortie de portée. Pas de runtime requis.
+
+[Retour en haut de page](#table-des-matières)
+
+## Diagnostics et messages d'erreur
+
+> **Définition.** Un **diagnostic** est tout message émis par le compilateur à propos du code source : erreur, avertissement, note, suggestion. La qualité des diagnostics est un sujet d'ingénierie à part entière, longtemps négligé puis remis au centre par Rust, Elm et Swift.
+
+### Anatomie d'un bon message
+
+1. **Localisation précise** : fichier, ligne, colonne, étendue (*span*) sur la portion fautive.
+2. **Cause primaire** : ce que le compilateur a vu de problématique, en termes du langage source.
+3. **Contexte** : la ou les définitions concernées (où le type a été déclaré, où la variable a été *moved*).
+4. **Explication** : pourquoi c'est une erreur (la règle violée).
+5. **Suggestion** correctrice quand elle est mécanique : « ajoutez `&` », « importez `std::collections::HashMap` », « renommez en `foo` (typo possible) ».
+6. **Exemple positif** : code qui *aurait* fonctionné, idéalement avec un *diff* applicable.
+
+### Le standard Rust
+
+`rustc` rend la barre haute : étendues colorées, codes d'erreur stables (`E0382`), explications longues accessibles via `--explain`, suggestions structurées que `cargo fix` peut appliquer mécaniquement, *teach mode* pour les débutants. Le secret est en grande partie une **structure de données riche** dans le compilateur : un diagnostic Rust n'est pas une chaîne, c'est un arbre annoté que l'IDE (rust-analyzer) consomme aussi.
+
+### Récupération d'erreurs
+
+Un parser robuste **ne s'arrête pas** à la première erreur. Stratégies classiques :
+
+- **synchronisation** sur des tokens « stables » (point-virgule, accolade fermante) ;
+- **erreurs de panic mode** : on jette les tokens jusqu'à un point de synchronisation ;
+- **réparation** : on insère ou supprime un token plausible et on continue (Merr, *minimum-edit error recovery*) ;
+- **îlots résilients** : Tree-sitter parse en présence d'erreurs et conserve un AST partiel — précieux pour les éditeurs.
+
+### Avertissements et lints
+
+Au-delà des erreurs, le compilateur émet des **avertissements** (code suspect mais légal) et des **lints** (règles configurables : style, motifs déconseillés, complexité). `clippy` (Rust), `clang-tidy` (C/C++), ESLint (JavaScript) sont des couches de lints construites sur l'AST ou l'IR du compilateur.
+
+[Retour en haut de page](#table-des-matières)
+
+## Bootstrapping et confiance
+
+> **Définition.** Le **bootstrapping** d'un compilateur est l'opération consistant à compiler un compilateur écrit dans son propre langage (le langage `L` est implémenté en `L`). Un nouveau compilateur passe en général par plusieurs étapes (*stages*) : `stage0` (compilateur de référence existant) compile `stage1` (le compilateur cible compilé par stage0), qui à son tour compile `stage2` (le compilateur cible compilé par lui-même).
+
+### Pourquoi bootstrapper ?
+
+- **Auto-validation** : si le langage est expressif et le compilateur correct, écrire le compilateur dans son propre langage est la meilleure démonstration.
+- **Dogfooding** : les concepteurs subissent leur langage en premier ; les imperfections remontent vite.
+- **Indépendance** : à terme, le projet ne dépend plus que de son binaire de référence, distribué pour amorcer l'auto-compilation.
+
+### Cas historiques
+
+- Niklaus **Wirth** réimplémenta Pascal en Pascal ; le compilateur P4 a servi de gabarit pédagogique pendant deux décennies.
+- **GCC** est écrit en C++ (autrefois C) et se compile lui-même via les fameux *stages* `stage1`/`stage2`/`stage3`. La comparaison binaire entre `stage2` et `stage3` est un test d'intégrité majeur : ils doivent être identiques.
+- **Rustc** est écrit en Rust et se compile via un compilateur précédent fourni par `rustup` ; le projet maintient une chaîne d'amorçage manuelle (`mrustc`) qui repart d'un sous-ensemble traduit en C++.
+- **OCaml** : `ocamlc` (bytecode) bootstrap `ocamlopt` (natif) qui se recompile lui-même.
+
+### *Reflections on Trusting Trust* — Ken Thompson, 1984
+
+L'**attaque de Thompson** (« Reflections on Trusting Trust », ACM Turing Award lecture) est l'argument de sécurité le plus cité dans l'histoire des compilateurs. Idée :
+
+1. On modifie le compilateur `C` pour qu'il insère, à la compilation de `login`, une porte dérobée.
+2. On modifie en plus `C` pour qu'à la compilation de **lui-même** il réinsère **les deux modifications**.
+3. On recompile `C` une fois, puis on retire les sources malveillantes : le binaire `C` reste infecté et propage l'infection à toutes ses descendances, sans laisser de trace dans les sources.
+
+Conséquence : la confiance dans un binaire ne peut pas se dériver uniquement de la lecture de ses sources, ni de celles de son compilateur, ni de celles du compilateur de son compilateur — c'est une régression infinie. La parade pratique est la **compilation reproductible** (*reproducible builds*) et le **bootstrapping diversifié** (*Diverse Double-Compiling* de David A. Wheeler) : compiler `C` avec deux compilateurs indépendants `A` et `B`, puis comparer les binaires obtenus en `stage2`.
+
+[Retour en haut de page](#table-des-matières)
+
+## WebAssembly et générateurs de code alternatifs
+
+### WebAssembly comme cible de compilation
+
+**WebAssembly** (Wasm) est un format binaire de bytecode pour une machine à pile virtuelle, standardisé par le W3C. Conçu initialement pour le navigateur, il est devenu une cible générale (Wasmtime, Wasmer, WasmEdge, conteneurs « micro-VM »). Caractéristiques pertinentes pour un compilateur :
+
+- **typé statiquement** : 4 types numériques (`i32`, `i64`, `f32`, `f64`) plus références ;
+- **structuré** : pas de `goto` libre, mais des blocs (`block`, `loop`, `if`) à branches étiquetées ;
+- **sandboxé** : la mémoire linéaire est un tableau d'octets borné, pas d'accès direct à l'OS ;
+- **ABI** définie par WASI (*WebAssembly System Interface*) pour les invocations système.
+
+Côté compilateur, viser Wasm impose une *forme reductible* du CFG (toutes les boucles ont un en-tête unique). LLVM y parvient via une passe de *relooper* dérivée des travaux d'Emscripten ; `wasm-ld` joue le rôle du linker.
+
+Cas industriels : `clang --target=wasm32-wasi`, `rustc --target=wasm32-unknown-unknown`, Go (depuis 1.21), Swift, .NET (Blazor), AssemblyScript.
+
+### Cranelift : un back-end alternatif à LLVM
+
+**Cranelift** est un générateur de code écrit en Rust, hébergé par Bytecode Alliance. Conçu d'abord pour Wasmtime (JIT WebAssembly), il sert aussi de back-end alternatif à `rustc` (`-Zcodegen-backend=cranelift`) pour les *debug builds* rapides.
+
+| Critère | LLVM | Cranelift |
+|---------|------|-----------|
+| Qualité du code optimisé | très haute (>30 ans d'optims) | moyenne |
+| Vitesse de compilation | lente | très rapide (objectif principal) |
+| Surface (taille binaire, dépendances) | énorme (\~15 millions de lignes C++) | modérée (Rust pur) |
+| Cibles | x86, ARM, RISC-V, GPU, Wasm, MIPS… | x86-64, ARM64, s390x, RISC-V |
+| IR | LLVM IR (textuel + bitcode) | CLIF (Cranelift IR) |
+| Modèle d'usage | AOT et JIT (ORC) | JIT prioritaire, AOT possible |
+
+Le compromis est explicite : Cranelift sacrifie une partie des optimisations agressives de LLVM pour offrir des temps de compilation comparables à un interprète, ce qui est précieux pour un JIT Wasm ou une boucle d'itération `cargo check`. D'autres alternatives existent : QBE (minimaliste, pédagogique), Go SSA backend (interne au compilateur Go), .NET RyuJIT.
+
+### Front-end / back-end : quelle réutilisabilité ?
+
+L'argument *N + M ≪ N × M* de l'IR commune n'est pas gratuit. En pratique :
+
+- **Front-ends partageant LLVM IR** : Clang (C/C++/Obj-C), Rust, Swift, Julia, Crystal, Zig (en transition), Pony, Pyston. Chaque front-end maintient malgré tout son **HIR/MIR** spécifique pour les vérifications langagières (emprunt Rust, ARC Swift, types dépendants Julia) avant d'abaisser vers LLVM IR.
+- **Back-ends partagés** : un même back-end LLVM accepte des dizaines d'IR sources en passant par LLVM IR. La réutilisation est réelle pour la phase de codegen (sélection d'instructions, allocation de registres, ordonnancement, formats objet).
+- **Limites** : LLVM IR est typé mais sans notion de *traits* Rust, de classes Swift, de *generics* Java ; toute information sémantique perdue dans l'abaissement n'est pas récupérable. D'où la tendance moderne à **conserver une MIR de haut niveau** spécifique au langage (MIR Rust, SIL Swift, GIMPLE GCC) avant l'abaissement vers l'IR partagée.
 
 [Retour en haut de page](#table-des-matières)
 
