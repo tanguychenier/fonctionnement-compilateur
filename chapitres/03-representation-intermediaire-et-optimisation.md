@@ -47,7 +47,7 @@ Une IR linéaire se découpe en blocs de base : suites maximales d'instructions 
 ```mermaid
 graph TD
     E["Entrée : s = 0, i = 1"] --> T{"i > n ?"}
-    T -->|"non"| B["s = s + i*i ; i = i + 1"]
+    T -->|"non"| B["s = s + i·i ; i = i + 1"]
     B --> T
     T -->|"oui"| S["return s"]
 ```

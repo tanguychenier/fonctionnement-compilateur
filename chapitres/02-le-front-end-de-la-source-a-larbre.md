@@ -331,10 +331,10 @@ Chaque nœud expose une méthode `accept(v)`. Le visiteur `v` implémente `visit
 
 ```mermaid
 graph TD
-    R["Plus (racine)"] --> A["Num(1)"]
+    R["Plus (racine)"] --> A["Num 1"]
     R --> M["Mul"]
-    M --> B["Num(2)"]
-    M --> C["Num(3)"]
+    M --> B["Num 2"]
+    M --> C["Num 3"]
     V["Visiteur Évaluateur"] -.->|"visit chaque nœud"| R
 ```
 
